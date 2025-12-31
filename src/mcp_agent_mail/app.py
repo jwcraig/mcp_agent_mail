@@ -3368,6 +3368,403 @@ def build_mcp_server() -> FastMCP:
         await ctx.info(f"whois for '{agent_name}' in '{project.human_key}' returned {len(recent)} commits")
         return profile
 
+    @mcp.tool(name="list_projects")
+    @_instrument_tool("list_projects", cluster=CLUSTER_SETUP, capabilities={"identity", "read"}, complexity="low")
+    async def list_projects(ctx: Context, limit: int = 100) -> list[dict[str, Any]]:
+        """List known projects.
+
+        This exists primarily for CLI parity so the CLI does not need direct access to the DB file.
+        """
+        await ensure_schema()
+        capped = max(0, min(1000, int(limit)))
+        async with get_session() as session:
+            result = await session.execute(select(Project).order_by(desc(cast(Any, Project.created_at))).limit(capped))
+            projects = list(result.scalars().all())
+        await _ctx_info_safe(ctx, f"Listed {len(projects)} project(s).")
+        return [
+            {"id": p.id, "slug": p.slug, "human_key": p.human_key, "created_at": _iso(p.created_at)}
+            for p in projects
+        ]
+
+    @mcp.tool(name="list_agents")
+    @_instrument_tool("list_agents", cluster=CLUSTER_IDENTITY, capabilities={"identity", "read"}, complexity="low", project_arg="project_key")
+    async def list_agents(ctx: Context, project_key: str, limit: int = 500) -> list[dict[str, Any]]:
+        """List agents registered in a project (most-recently-active first)."""
+        project = await _get_project_by_identifier(project_key)
+        if project.id is None:
+            return []
+        await ensure_schema()
+        capped = max(0, min(2000, int(limit)))
+        async with get_session() as session:
+            result = await session.execute(
+                select(Agent)
+                .where(cast(Any, Agent.project_id) == project.id)
+                .order_by(desc(cast(Any, Agent.last_active_ts)))
+                .limit(capped)
+            )
+            agents = list(result.scalars().all())
+        await _ctx_info_safe(ctx, f"Listed {len(agents)} agent(s) for project '{project.human_key}'.")
+        return [
+            {
+                "id": a.id,
+                "name": a.name,
+                "program": a.program,
+                "model": a.model,
+                "task_description": a.task_description,
+                "inception_ts": _iso(a.inception_ts),
+                "last_active_ts": _iso(a.last_active_ts),
+                "contact_policy": getattr(a, "contact_policy", None),
+                "attachments_policy": getattr(a, "attachments_policy", None),
+            }
+            for a in agents
+        ]
+
+    @mcp.tool(name="list_file_reservations")
+    @_instrument_tool(
+        "list_file_reservations",
+        cluster=CLUSTER_FILE_RESERVATIONS,
+        capabilities={"file_reservations", "read"},
+        complexity="low",
+        project_arg="project_key",
+    )
+    async def list_file_reservations(
+        ctx: Context,
+        project_key: str,
+        *,
+        active_only: bool = True,
+        expiring_within_minutes: Optional[int] = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """List file reservations for a project with agent names.
+
+        Parameters mirror the lightweight SQLite-backed CLI inspection commands:
+        - active_only=True approximates "active"
+        - expiring_within_minutes sets a "soon" filter window
+        """
+        project = await _get_project_by_identifier(project_key)
+        if project.id is None:
+            return []
+        await ensure_schema()
+        capped = max(0, min(2000, int(limit)))
+        now = datetime.now(timezone.utc)
+
+        async with get_session() as session:
+            stmt = (
+                cast(Any, select(FileReservation, Agent.name))  # type: ignore[call-overload]
+                .join(Agent, cast(Any, FileReservation.agent_id) == Agent.id)
+                .where(cast(Any, FileReservation.project_id) == project.id)
+            )
+            if expiring_within_minutes is not None:
+                window_m = max(0, int(expiring_within_minutes))
+                cutoff = now + timedelta(minutes=window_m)
+                stmt = stmt.where(
+                    cast(Any, FileReservation.released_ts).is_(None),
+                    cast(Any, FileReservation.expires_ts) > now,
+                    cast(Any, FileReservation.expires_ts) <= cutoff,
+                )
+            elif active_only:
+                stmt = stmt.where(
+                    cast(Any, FileReservation.released_ts).is_(None),
+                    cast(Any, FileReservation.expires_ts) > now,
+                )
+            stmt = stmt.order_by(asc(cast(Any, FileReservation.expires_ts))).limit(capped)
+            rows = list((await session.execute(stmt)).all())
+
+        await _ctx_info_safe(
+            ctx,
+            f"Listed {len(rows)} file reservation(s) for '{project.human_key}' (active_only={active_only}).",
+        )
+        out: list[dict[str, Any]] = []
+        for reservation, agent_name in rows:
+            out.append(
+                {
+                    "id": reservation.id,
+                    "agent": agent_name,
+                    "path_pattern": reservation.path_pattern,
+                    "exclusive": reservation.exclusive,
+                    "expires_ts": _iso(reservation.expires_ts),
+                    "released_ts": _iso(reservation.released_ts) if reservation.released_ts else None,
+                    "reason": reservation.reason,
+                    "created_ts": _iso(reservation.created_ts),
+                }
+            )
+        return out
+
+    async def _agent_dependency_summary(project: Project, agent: Agent) -> dict[str, Any]:
+        if project.id is None or agent.id is None:
+            raise ValueError("Project/agent IDs must exist.")
+        await ensure_schema()
+        now = datetime.now(timezone.utc)
+        async with get_session() as session:
+            unread = await session.execute(
+                select(func.count(MessageRecipient.message_id))
+                .join(Message, MessageRecipient.message_id == Message.id)
+                .where(
+                    cast(Any, Message.project_id) == project.id,
+                    cast(Any, MessageRecipient.agent_id) == agent.id,
+                    cast(Any, MessageRecipient.read_ts).is_(None),
+                )
+            )
+            unread_messages = int(unread.scalar_one() or 0)
+            active_res = await session.execute(
+                select(func.count(FileReservation.id)).where(
+                    cast(Any, FileReservation.project_id) == project.id,
+                    cast(Any, FileReservation.agent_id) == agent.id,
+                    cast(Any, FileReservation.released_ts).is_(None),
+                    cast(Any, FileReservation.expires_ts) > now,
+                )
+            )
+            active_reservations = int(active_res.scalar_one() or 0)
+            sent = await session.execute(
+                select(func.count(Message.id)).where(
+                    cast(Any, Message.project_id) == project.id,
+                    cast(Any, Message.sender_id) == agent.id,
+                )
+            )
+            sent_messages = int(sent.scalar_one() or 0)
+        return {
+            "agent_id": agent.id,
+            "unread_messages": unread_messages,
+            "active_reservations": active_reservations,
+            "sent_messages": sent_messages,
+            "can_delete": unread_messages == 0 and active_reservations == 0,
+        }
+
+    @mcp.tool(name="agent_dependencies")
+    @_instrument_tool(
+        "agent_dependencies",
+        cluster=CLUSTER_IDENTITY,
+        capabilities={"identity", "read"},
+        complexity="low",
+        project_arg="project_key",
+        agent_arg="agent_name",
+    )
+    async def agent_dependencies(ctx: Context, project_key: str, agent_name: str) -> dict[str, Any]:
+        """Return dependency counts for an agent to support safe deletion workflows."""
+        project = await _get_project_by_identifier(project_key)
+        agent = await _get_agent(project, agent_name)
+        deps = await _agent_dependency_summary(project, agent)
+        await _ctx_info_safe(ctx, f"Computed dependencies for '{agent.name}' in '{project.human_key}'.")
+        return deps
+
+    @mcp.tool(name="list_acks_pending")
+    @_instrument_tool(
+        "list_acks_pending",
+        cluster=CLUSTER_MESSAGING,
+        capabilities={"messaging", "read"},
+        complexity="low",
+        project_arg="project_key",
+        agent_arg="agent_name",
+    )
+    async def list_acks_pending(ctx: Context, project_key: str, agent_name: str, limit: int = 20) -> list[dict[str, Any]]:
+        """List ack-required messages where this agent has not acknowledged."""
+        project = await _get_project_by_identifier(project_key)
+        agent = await _get_agent(project, agent_name)
+        if project.id is None or agent.id is None:
+            return []
+        await ensure_schema()
+        capped = max(0, min(500, int(limit)))
+        sender_alias = aliased(Agent)
+        async with get_session() as session:
+            result = await session.execute(
+                cast(Any, select(  # type: ignore[call-overload]
+                    Message.id,
+                    Message.subject,
+                    Message.importance,
+                    Message.created_ts,
+                    Message.thread_id,
+                    cast(Any, sender_alias.name).label("sender_name"),
+                ))
+                .join(MessageRecipient, cast(Any, MessageRecipient.message_id) == Message.id)
+                .join(sender_alias, cast(Any, Message.sender_id) == sender_alias.id)
+                .where(
+                    cast(Any, Message.project_id) == project.id,
+                    cast(Any, MessageRecipient.agent_id) == agent.id,
+                    cast(Any, Message.ack_required).is_(True),
+                    cast(Any, MessageRecipient.ack_ts).is_(None),
+                )
+                .order_by(desc(cast(Any, Message.created_ts)))
+                .limit(capped)
+            )
+            rows = list(result.all())
+        await _ctx_info_safe(ctx, f"Listed {len(rows)} pending ack(s) for '{agent.name}'.")
+        return [
+            {
+                "id": int(r[0]),
+                "subject": r[1],
+                "importance": r[2],
+                "created_ts": _iso(r[3]),
+                "thread_id": r[4],
+                "sender": r[5],
+            }
+            for r in rows
+        ]
+
+    @mcp.tool(name="list_acks_overdue")
+    @_instrument_tool(
+        "list_acks_overdue",
+        cluster=CLUSTER_MESSAGING,
+        capabilities={"messaging", "read"},
+        complexity="low",
+        project_arg="project_key",
+        agent_arg="agent_name",
+    )
+    async def list_acks_overdue(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        hours: int = 24,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """List ack-required messages older than threshold where acknowledgement is missing."""
+        project = await _get_project_by_identifier(project_key)
+        agent = await _get_agent(project, agent_name)
+        if project.id is None or agent.id is None:
+            return []
+        await ensure_schema()
+        capped = max(0, min(500, int(limit)))
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=max(0, int(hours)))
+        sender_alias = aliased(Agent)
+        async with get_session() as session:
+            result = await session.execute(
+                cast(Any, select(  # type: ignore[call-overload]
+                    Message.id,
+                    Message.subject,
+                    Message.importance,
+                    Message.created_ts,
+                    Message.thread_id,
+                    cast(Any, sender_alias.name).label("sender_name"),
+                ))
+                .join(MessageRecipient, cast(Any, MessageRecipient.message_id) == Message.id)
+                .join(sender_alias, cast(Any, Message.sender_id) == sender_alias.id)
+                .where(
+                    cast(Any, Message.project_id) == project.id,
+                    cast(Any, MessageRecipient.agent_id) == agent.id,
+                    cast(Any, Message.ack_required).is_(True),
+                    cast(Any, MessageRecipient.ack_ts).is_(None),
+                    cast(Any, Message.created_ts) <= cutoff,
+                )
+                .order_by(asc(cast(Any, Message.created_ts)))
+                .limit(capped)
+            )
+            rows = list(result.all())
+        await _ctx_info_safe(ctx, f"Listed {len(rows)} overdue ack(s) for '{agent.name}'.")
+        return [
+            {
+                "id": int(r[0]),
+                "subject": r[1],
+                "importance": r[2],
+                "created_ts": _iso(r[3]),
+                "thread_id": r[4],
+                "sender": r[5],
+            }
+            for r in rows
+        ]
+
+    @mcp.tool(name="delete_agent")
+    @_instrument_tool(
+        "delete_agent",
+        cluster=CLUSTER_IDENTITY,
+        capabilities={"identity", "write"},
+        project_arg="project_key",
+        agent_arg="agent_name",
+    )
+    async def delete_agent_tool(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        *,
+        force: bool = False,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Delete (deactivate) an agent from a project.
+
+        Notes
+        -----
+        - We do not hard-delete agent rows by default because messages reference sender_id and
+          databases like Postgres enforce foreign keys. Instead, we:
+          1) Release active file reservations
+          2) Remove recipient rows (so the agent has no inbox state)
+          3) Remove contact links
+          4) Rename the agent so it no longer appears in normal listings by its old name
+        """
+        project = await _get_project_by_identifier(project_key)
+        agent = await _get_agent(project, agent_name)
+        deps = await _agent_dependency_summary(project, agent)
+        if dry_run:
+            await _ctx_info_safe(ctx, f"delete_agent(dry_run) for '{agent.name}' in '{project.human_key}'.")
+            return deps
+        if not deps["can_delete"] and not force:
+            raise ToolExecutionError(
+                "DEPENDENCIES",
+                (
+                    f"Cannot delete agent '{agent.name}': {deps['unread_messages']} unread message(s), "
+                    f"{deps['active_reservations']} active reservation(s). Use force=true to override."
+                ),
+                recoverable=True,
+                data=deps,
+            )
+        if agent.id is None:
+            raise ValueError("Agent must have an id.")
+        await ensure_schema()
+        now = datetime.now(timezone.utc)
+
+        from sqlalchemy import delete as _delete  # local to avoid top-level churn
+
+        released_reservations = 0
+        removed_recipient_entries = 0
+        removed_links = 0
+        new_name = f"Deleted-{agent.id}"
+
+        async with get_session() as session:
+            # Release active reservations
+            res = await session.execute(
+                update(FileReservation)
+                .where(
+                    cast(Any, FileReservation.agent_id) == agent.id,
+                    cast(Any, FileReservation.released_ts).is_(None),
+                )
+                .values(released_ts=now)
+            )
+            released_reservations = int(res.rowcount or 0)  # type: ignore[attr-defined]
+
+            # Remove message recipient entries (keeps messages, removes mailbox state for this agent)
+            rec = await session.execute(_delete(MessageRecipient).where(cast(Any, MessageRecipient.agent_id) == agent.id))
+            removed_recipient_entries = int(rec.rowcount or 0)  # type: ignore[attr-defined]
+
+            # Remove contact links (directed; agent may be in either side)
+            ln = await session.execute(
+                _delete(AgentLink).where(
+                    or_(
+                        cast(Any, AgentLink.a_agent_id) == agent.id,
+                        cast(Any, AgentLink.b_agent_id) == agent.id,
+                    )
+                )
+            )
+            removed_links = int(ln.rowcount or 0)  # type: ignore[attr-defined]
+
+            # Soft-delete: rename + lock down policies
+            db_agent = await session.get(Agent, agent.id)
+            if db_agent is None:
+                raise ToolExecutionError("NOT_FOUND", f"Agent id={agent.id} not found.", recoverable=True)
+            db_agent.name = new_name
+            db_agent.task_description = "[deleted]"
+            with contextlib.suppress(Exception):
+                db_agent.contact_policy = "block_all"
+            session.add(db_agent)
+            await session.commit()
+
+        await _ctx_info_safe(ctx, f"Deleted agent '{agent.name}' (renamed to '{new_name}') in '{project.human_key}'.")
+        return {
+            "deleted": True,
+            "agent_name": agent.name,
+            "new_name": new_name,
+            "released_reservations": released_reservations,
+            "removed_recipient_entries": removed_recipient_entries,
+            "removed_links": removed_links,
+            "orphaned_sent_messages": deps["sent_messages"],
+        }
+
     @mcp.tool(name="create_agent_identity")
     @_instrument_tool("create_agent_identity", cluster=CLUSTER_IDENTITY, capabilities={"identity"}, agent_arg="name_hint", project_arg="project_key")
     async def create_agent_identity(
