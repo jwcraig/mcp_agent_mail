@@ -1,0 +1,17 @@
+# Development override - use with: docker compose -f compose.yaml -f compose.dev.yaml up
+# Bind-mounts source for live editing. Restart container to pick up changes:
+#   docker compose -f compose.yaml -f compose.dev.yaml restart agent-mail
+services:
+  agent-mail:
+    # Run as root to avoid permission issues with bind mounts
+    user: root
+    volumes:
+      - agent_mail_data:/data
+      # Bind-mount source for live editing
+      - ./src:/app/src:cached
+    environment:
+      PYTHONUNBUFFERED: "1"
+      # Fix git ownership when running as root with appuser-owned data volume
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: "safe.directory"
+      GIT_CONFIG_VALUE_0: "/data/mailbox"

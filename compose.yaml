@@ -3,14 +3,20 @@ services:
     build: .
     environment:
       HTTP_HOST: "0.0.0.0"
+      # Store SQLite inside a Docker-managed volume (avoid bind-mounting WAL files on macOS).
+      DATABASE_URL: "sqlite+aiosqlite:////data/mailbox/storage.sqlite3"
       STORAGE_ROOT: "/data/mailbox"
       LOG_RICH_ENABLED: "true"
+      # Default: no auth for local development. To enable bearer auth, set:
+      #   AGENT_MAIL_HTTP_BEARER_TOKEN="<token>"
+      # and point clients at the same token via AGENT_MAIL_TOKEN="<token>".
+      HTTP_RBAC_ENABLED: "${HTTP_RBAC_ENABLED-false}"
+      HTTP_BEARER_TOKEN: "${AGENT_MAIL_HTTP_BEARER_TOKEN:-}"
     ports:
       - "8765:8765"
+      # Convenience alias: some local setups use 8675; map both to the same container port.
+      - "8675:8765"
     volumes:
       - agent_mail_data:/data
-      # Optional: mount a local .env file (read-only) for config
-      - ./.env:/app/.env:ro
 volumes:
   agent_mail_data:
-

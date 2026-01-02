@@ -130,6 +130,42 @@ scripts/run_server_with_token.sh
 uv run python -m mcp_agent_mail.cli config set-port 9000
 ```
 
+## Docker Compose (reproducible local server)
+
+If you want a reproducible “it runs the same everywhere” setup (and you don’t want the host to ever touch SQLite), use Docker Compose.
+
+This repo includes a minimal `compose.yaml` that:
+- Builds the image from this checkout
+- Runs the MCP HTTP server on port `8765`
+- Stores both the Git-backed archive and the SQLite DB in a Docker-managed volume under `/data`
+
+Why this matters on macOS
+------------------------
+SQLite WAL mode + bind-mounted volumes from macOS can cause intermittent `disk I/O error` under concurrent access. Using a Docker-managed volume for the SQLite file avoids that failure mode because the database lives inside Docker’s Linux VM/filesystem.
+
+### Start the server
+
+```bash
+docker compose up -d --build
+```
+
+This will create a container named `agent-mail` (service name) and a volume named `agent_mail_data` (compose-managed).
+
+### Configure the host CLI (recommended)
+
+From the host (outside the container), point your client (wrapper CLI, hooks, etc.) at the server:
+
+```bash
+export AGENT_MAIL_URL="http://127.0.0.1:8765/mcp/"
+export AGENT_MAIL_TOKEN=""  # set if you enable auth
+```
+
+If you enable RBAC in compose (set `HTTP_RBAC_ENABLED=true` and a `HTTP_BEARER_TOKEN`), then set `AGENT_MAIL_TOKEN` to match.
+
+### Postgres compose (optional)
+
+There is also a `docker-compose.yml` in this repo that brings up Postgres and configures `DATABASE_URL=postgres+asyncpg://...`. Treat it as an optional stack if you want to experiment with a real database backend.
+
 ## Ready-Made Blurb to Add to Your AGENTS.md or CLAUDE.md Files:
 <!-- BEGIN_AGENT_MAIL_SNIPPET -->
 ```

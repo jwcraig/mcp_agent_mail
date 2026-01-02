@@ -232,6 +232,7 @@ def get_settings() -> Settings:
         rbac_readonly_tools=_csv(
             "HTTP_RBAC_READONLY_TOOLS",
             default="health_check,fetch_inbox,whois,search_messages,summarize_thread,"
+            "inbox_status,"
             "list_projects,list_agents,list_file_reservations,list_acks_pending,list_acks_overdue,agent_dependencies",
         ),
         allow_localhost_unauthenticated=_bool(_decouple_config("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", default="true"), default=True),

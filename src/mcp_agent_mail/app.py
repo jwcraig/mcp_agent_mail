@@ -3765,6 +3765,105 @@ def build_mcp_server() -> FastMCP:
             "orphaned_sent_messages": deps["sent_messages"],
         }
 
+    @mcp.tool(name="purge_deleted_agents")
+    @_instrument_tool(
+        "purge_deleted_agents",
+        cluster=CLUSTER_IDENTITY,
+        capabilities={"identity", "write"},
+        project_arg="project_key",
+    )
+    async def purge_deleted_agents_tool(
+        ctx: Context,
+        project_key: str,
+        *,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Hard-delete all soft-deleted agents (those renamed to 'Deleted-*') and their orphaned messages.
+
+        Use this to clean up after delete_agent, which only soft-deletes due to FK constraints.
+        This permanently removes the agent rows and any messages they sent.
+
+        Parameters
+        ----------
+        project_key
+            Project path or slug.
+        dry_run
+            If True, report what would be deleted without actually deleting.
+
+        Returns
+        -------
+        dict
+            Summary of deleted agents and messages.
+        """
+        project = await _get_project_by_identifier(project_key)
+        if project.id is None:
+            return {"purged_agents": 0, "purged_messages": 0, "agents": []}
+
+        await ensure_schema()
+
+        from sqlalchemy import delete as _delete
+
+        async with get_session() as session:
+            # Find all soft-deleted agents in this project
+            result = await session.execute(
+                select(Agent)
+                .where(
+                    cast(Any, Agent.project_id) == project.id,
+                    cast(Any, Agent.name).like("Deleted-%"),
+                )
+            )
+            deleted_agents = list(result.scalars().all())
+
+            if not deleted_agents:
+                await _ctx_info_safe(ctx, f"No soft-deleted agents found in '{project.human_key}'.")
+                return {"purged_agents": 0, "purged_messages": 0, "agents": []}
+
+            agent_ids = [a.id for a in deleted_agents]
+            agent_names = [a.name for a in deleted_agents]
+
+            if dry_run:
+                # Count messages that would be deleted
+                msg_result = await session.execute(
+                    select(func.count())
+                    .select_from(Message)
+                    .where(cast(Any, Message.sender_id).in_(agent_ids))
+                )
+                msg_count = msg_result.scalar() or 0
+                await _ctx_info_safe(
+                    ctx,
+                    f"[dry_run] Would purge {len(deleted_agents)} agent(s) and {msg_count} message(s) in '{project.human_key}'.",
+                )
+                return {
+                    "dry_run": True,
+                    "purged_agents": len(deleted_agents),
+                    "purged_messages": msg_count,
+                    "agents": agent_names,
+                }
+
+            # Delete messages first (FK constraint: messages.sender_id -> agents.id)
+            msg_del = await session.execute(
+                _delete(Message).where(cast(Any, Message.sender_id).in_(agent_ids))
+            )
+            purged_messages = int(msg_del.rowcount or 0)
+
+            # Delete the agents
+            agent_del = await session.execute(
+                _delete(Agent).where(cast(Any, Agent.id).in_(agent_ids))
+            )
+            purged_agents = int(agent_del.rowcount or 0)
+
+            await session.commit()
+
+        await _ctx_info_safe(
+            ctx,
+            f"Purged {purged_agents} agent(s) and {purged_messages} message(s) from '{project.human_key}'.",
+        )
+        return {
+            "purged_agents": purged_agents,
+            "purged_messages": purged_messages,
+            "agents": agent_names,
+        }
+
     @mcp.tool(name="create_agent_identity")
     @_instrument_tool("create_agent_identity", cluster=CLUSTER_IDENTITY, capabilities={"identity"}, agent_arg="name_hint", project_arg="project_key")
     async def create_agent_identity(
@@ -5319,6 +5418,191 @@ def build_mcp_server() -> FastMCP:
             return items
         except Exception as exc:
             _rich_error_panel("fetch_inbox", {"error": str(exc)})
+            raise
+
+    @mcp.tool(name="inbox_status")
+    @_instrument_tool(
+        "inbox_status",
+        cluster=CLUSTER_MESSAGING,
+        capabilities={"messaging", "read"},
+        project_arg="project_key",
+        agent_arg="agent_name",
+    )
+    async def inbox_status(
+        ctx: Context,
+        project_key: str,
+        agent_name: Optional[str] = None,
+        since_ts: Optional[str] = None,
+        urgent_only: bool = False,
+        recent_seconds: int = 3600,
+    ) -> dict[str, Any]:
+        """
+        Return lightweight inbox status for hooks and UIs (no bodies, no mutation).
+
+        This is designed for "check inbox" workflows where a caller (e.g. Claude hooks)
+        wants to know whether attention is needed without fetching message bodies.
+
+        Modes
+        -----
+        - Per-agent status (recommended): provide `agent_name`.
+          Returns:
+            - `unread_count` and `latest_unread_ts`
+            - optionally `new_since_count` and `latest_new_ts` when `since_ts` is provided
+            - optionally `new_since_unread_count` when `since_ts` is provided
+        - Project activity status: omit `agent_name`.
+          Returns:
+            - `recent_message_count` and `latest_recent_ts` over the last `recent_seconds`
+
+        Parameters
+        ----------
+        project_key : str
+            Project slug or human key.
+        agent_name : Optional[str]
+            Agent name for per-agent status.
+        since_ts : Optional[str]
+            ISO-8601 timestamp string; counts "new since" messages for the agent when provided.
+        urgent_only : bool
+            If true, restricts counts to importance in {high, urgent}.
+        recent_seconds : int
+            When `agent_name` is omitted, the window (seconds) used for recent project activity.
+
+        Returns
+        -------
+        dict
+            Status payload (see Modes above).
+        """
+        # Validate inputs early with helpful errors.
+        since_dt = _validate_iso_timestamp(since_ts, "since_ts")
+        if recent_seconds < 1:
+            raise ToolExecutionError(
+                error_type="INVALID_WINDOW",
+                message=f"recent_seconds must be at least 1, got {recent_seconds}.",
+                recoverable=True,
+                data={"provided": recent_seconds, "min": 1},
+            )
+
+        try:
+            project = await _get_project_by_identifier(project_key)
+            await ensure_schema()
+            async with get_session() as session:
+                if agent_name:
+                    agent = await _get_agent(project, agent_name)
+                    if project.id is None or agent.id is None:
+                        raise ValueError("Project and agent must have ids before checking inbox status.")
+
+                    unread_stmt = (
+                        cast(Any, select(  # type: ignore[call-overload]
+                            func.count(cast(Any, MessageRecipient.message_id)).label("unread_count"),  # type: ignore[arg-type]
+                            func.max(cast(Any, Message.created_ts)).label("latest_unread_ts"),
+                        ))
+                        .select_from(MessageRecipient)
+                        .join(Message, cast(Any, MessageRecipient.message_id == Message.id))
+                        .where(
+                            cast(Any, Message.project_id) == project.id,
+                            cast(Any, MessageRecipient.agent_id) == agent.id,
+                            cast(Any, MessageRecipient.read_ts).is_(None),
+                        )
+                    )
+                    if urgent_only:
+                        unread_stmt = unread_stmt.where(cast(Any, Message.importance).in_(["high", "urgent"]))  # type: ignore[arg-type]
+                    unread_row = (await session.execute(unread_stmt)).mappings().one()
+                    unread_count = int(unread_row.get("unread_count") or 0)
+                    latest_unread_ts = unread_row.get("latest_unread_ts")
+
+                    payload: dict[str, Any] = {
+                        "scope": "agent",
+                        "project_key": project.human_key,
+                        "agent_name": agent.name,
+                        "urgent_only": bool(urgent_only),
+                        "unread_count": unread_count,
+                        "latest_unread_ts": _iso(latest_unread_ts) if latest_unread_ts else None,
+                    }
+
+                    if since_dt is not None:
+                        new_since_stmt = (
+                            cast(Any, select(  # type: ignore[call-overload]
+                                func.count(cast(Any, MessageRecipient.message_id)).label("new_since_count"),  # type: ignore[arg-type]
+                                func.max(cast(Any, Message.created_ts)).label("latest_new_ts"),
+                            ))
+                            .select_from(MessageRecipient)
+                            .join(Message, cast(Any, MessageRecipient.message_id == Message.id))
+                            .where(
+                                cast(Any, Message.project_id) == project.id,
+                                cast(Any, MessageRecipient.agent_id) == agent.id,
+                                cast(Any, Message.created_ts) > since_dt,
+                            )
+                        )
+                        if urgent_only:
+                            new_since_stmt = new_since_stmt.where(cast(Any, Message.importance).in_(["high", "urgent"]))  # type: ignore[arg-type]
+                        new_since_row = (await session.execute(new_since_stmt)).mappings().one()
+                        new_since_count = int(new_since_row.get("new_since_count") or 0)
+                        latest_new_ts = new_since_row.get("latest_new_ts")
+
+                        new_since_unread_stmt = (
+                            cast(Any, select(  # type: ignore[call-overload]
+                                func.count(cast(Any, MessageRecipient.message_id)).label("new_since_unread_count"),  # type: ignore[arg-type]
+                            ))
+                            .select_from(MessageRecipient)
+                            .join(Message, cast(Any, MessageRecipient.message_id == Message.id))
+                            .where(
+                                cast(Any, Message.project_id) == project.id,
+                                cast(Any, MessageRecipient.agent_id) == agent.id,
+                                cast(Any, Message.created_ts) > since_dt,
+                                cast(Any, MessageRecipient.read_ts).is_(None),
+                            )
+                        )
+                        if urgent_only:
+                            new_since_unread_stmt = new_since_unread_stmt.where(cast(Any, Message.importance).in_(["high", "urgent"]))  # type: ignore[arg-type]
+                        new_since_unread_row = (await session.execute(new_since_unread_stmt)).mappings().one()
+                        new_since_unread_count = int(new_since_unread_row.get("new_since_unread_count") or 0)
+
+                        payload.update(
+                            {
+                                "since_ts": _iso(since_dt),
+                                "new_since_count": new_since_count,
+                                "latest_new_ts": _iso(latest_new_ts) if latest_new_ts else None,
+                                "new_since_unread_count": new_since_unread_count,
+                            }
+                        )
+                    await ctx.info(
+                        f"Inbox status for '{agent.name}': unread={unread_count}"
+                        + (f", new_since={payload.get('new_since_count')}" if since_dt is not None else "")
+                    )
+                    return payload
+
+                # Project-wide activity mode (no agent_name).
+                if project.id is None:
+                    raise ValueError("Project must have an id before checking inbox status.")
+                window_start = datetime.now(timezone.utc) - timedelta(seconds=int(recent_seconds))
+                recent_stmt = (
+                    cast(Any, select(  # type: ignore[call-overload]
+                        func.count(cast(Any, Message.id)).label("recent_message_count"),  # type: ignore[arg-type]
+                        func.max(cast(Any, Message.created_ts)).label("latest_recent_ts"),
+                    ))
+                    .select_from(Message)
+                    .where(
+                        cast(Any, Message.project_id) == project.id,
+                        cast(Any, Message.created_ts) > window_start,
+                    )
+                )
+                if urgent_only:
+                    recent_stmt = recent_stmt.where(cast(Any, Message.importance).in_(["high", "urgent"]))  # type: ignore[arg-type]
+                recent_row = (await session.execute(recent_stmt)).mappings().one()
+                recent_count = int(recent_row.get("recent_message_count") or 0)
+                latest_recent_ts = recent_row.get("latest_recent_ts")
+                payload = {
+                    "scope": "project",
+                    "project_key": project.human_key,
+                    "urgent_only": bool(urgent_only),
+                    "recent_seconds": int(recent_seconds),
+                    "window_start_ts": _iso(window_start),
+                    "recent_message_count": recent_count,
+                    "latest_recent_ts": _iso(latest_recent_ts) if latest_recent_ts else None,
+                }
+                await ctx.info(f"Project inbox status: recent={recent_count} (window={recent_seconds}s)")
+                return payload
+        except Exception as exc:
+            _rich_error_panel("inbox_status", {"error": str(exc)})
             raise
 
     @mcp.tool(name="mark_message_read")
